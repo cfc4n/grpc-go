@@ -20,7 +20,9 @@ package grpc
 
 import (
 	"context"
+	"google.golang.org/grpc/internal/grpcrand"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
@@ -62,6 +64,8 @@ type scState struct {
 	addr Address // The v1 address type.
 	s    connectivity.State
 	down func(error)
+
+	cnt uint //连接次数
 }
 
 type balancerWrapper struct {
@@ -199,19 +203,49 @@ func (bw *balancerWrapper) lbWatcher() {
 			}
 			bw.mu.Unlock()
 			for _, a := range add {
-				sc, err := bw.cc.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{})
-				if err != nil {
-					grpclog.Warningf("Error creating connection to %v. Err: %v", a, err)
-				} else {
-					bw.mu.Lock()
-					bw.conns[a] = sc
-					bw.connSt[sc] = &scState{
-						addr: resAddrs[a],
-						s:    connectivity.Idle,
+				//判断bw.conns[a]是否存在
+				var cnt uint
+				bw.mu.Lock()
+				if sc, found := bw.conns[a]; found {
+					//状态是否是连接中
+					if st, found1 := bw.connSt[sc]; found1 {
+						//如果这地址的状态是Idl、 connection或 ready，则直接跳过
+						switch st.s {
+						case connectivity.Idle:
+							fallthrough
+						case connectivity.Connecting:
+							fallthrough
+						case connectivity.Ready:
+							continue
+						default:
+						}
+						cnt = st.cnt
 					}
-					bw.mu.Unlock()
-					sc.Connect()
 				}
+				bw.mu.Unlock()
+
+				func() {
+					retryCount := balancer_backoff(cnt)
+					timer := time.NewTimer(retryCount)
+					select {
+					case <-timer.C:
+						sc, err := bw.cc.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{})
+						if err != nil {
+							grpclog.Warningf("Error creating connection to %v. Err: %v", a, err)
+						} else {
+							bw.mu.Lock()
+							bw.conns[a] = sc
+							bw.connSt[sc] = &scState{
+								addr: resAddrs[a],
+								s:    connectivity.Idle,
+								cnt:  cnt + 1, //次数加1
+							}
+							bw.mu.Unlock()
+							sc.Connect()
+						}
+					}
+				}()
+
 			}
 			for _, c := range del {
 				bw.cc.RemoveSubConn(c)
@@ -233,6 +267,7 @@ func (bw *balancerWrapper) HandleSubConnStateChange(sc balancer.SubConn, s conne
 	oldS := scSt.s
 	scSt.s = s
 	if oldS != connectivity.Ready && s == connectivity.Ready {
+		scSt.cnt = 0 //当连接成功后，重置为0
 		scSt.down = bw.balancer.Up(scSt.addr)
 	} else if oldS == connectivity.Ready && s != connectivity.Ready {
 		if scSt.down != nil {
@@ -331,4 +366,26 @@ func (bw *balancerWrapper) Pick(ctx context.Context, opts balancer.PickOptions) 
 		// connected.
 		return nil, nil, balancer.ErrNoSubConnAvailable
 	}
+}
+
+func balancer_backoff(retries uint) time.Duration {
+	var delay uint
+	delay = 1 << uint(retries+6)
+	if delay == 0 {
+		delay = 1
+	}
+
+	//最小delay 时间 30S
+	if delay < 30 {
+		delay = 30
+	}
+
+	//最大delay时间为86400S
+	if delay > 86400 {
+		delay = 86400
+	}
+
+	delay += uint(grpcrand.Intn(180))
+
+	return time.Duration(int64(delay)) * time.Second
 }
