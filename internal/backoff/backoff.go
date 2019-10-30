@@ -56,23 +56,45 @@ type Exponential struct {
 
 // Backoff returns the amount of time to wait before the next retry given the
 // number of retries.
+//func (bc Exponential) Backoff(retries int) time.Duration {
+//	if retries == 0 {
+//		return baseDelay
+//	}
+//	backoff, max := float64(baseDelay), float64(bc.MaxDelay)
+//	for backoff < max && retries > 0 {
+//		backoff *= factor
+//		retries--
+//	}
+//	if backoff > max {
+//		backoff = max
+//	}
+//	// Randomize backoff delays so that if a cluster of requests start at
+//	// the same time, they won't operate in lockstep.
+//	backoff *= 1 + jitter*(grpcrand.Float64()*2-1)
+//	if backoff < 0 {
+//		return 0
+//	}
+//	return time.Duration(backoff)
+//}
+
 func (bc Exponential) Backoff(retries int) time.Duration {
-	if retries == 0 {
-		return baseDelay
+	var delay uint
+	delay = 1 << uint(retries+6)
+	if delay == 0 {
+		delay = 1
 	}
-	backoff, max := float64(baseDelay), float64(bc.MaxDelay)
-	for backoff < max && retries > 0 {
-		backoff *= factor
-		retries--
+
+	//最小delay 时间 30S
+	if delay < 30 {
+		delay = 30
 	}
-	if backoff > max {
-		backoff = max
+
+	//最大delay时间为86400S
+	if delay > 86400 {
+		delay = 86400
 	}
-	// Randomize backoff delays so that if a cluster of requests start at
-	// the same time, they won't operate in lockstep.
-	backoff *= 1 + jitter*(grpcrand.Float64()*2-1)
-	if backoff < 0 {
-		return 0
-	}
-	return time.Duration(backoff)
+
+	delay += uint(grpcrand.Intn(180))
+
+	return time.Duration(delay) * time.Second
 }

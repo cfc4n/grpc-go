@@ -50,6 +50,9 @@ func (bwb *balancerWrapperBuilder) Build(cc balancer.ClientConn, opts balancer.B
 		state:      connectivity.Idle,
 	}
 	cc.UpdateBalancerState(connectivity.Idle, bw)
+
+	g_grpcBackOffRec.addrBackOffRecord = make(map[string]BackOffUse, 1024)
+
 	go bw.lbWatcher()
 	return bw
 }

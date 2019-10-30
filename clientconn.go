@@ -130,6 +130,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		czData:            new(channelzData),
 		firstResolveEvent: grpcsync.NewEvent(),
 	}
+
 	cc.retryThrottler.Store((*retryThrottler)(nil))
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
@@ -751,6 +752,25 @@ func (cc *ClientConn) incrCallsFailed() {
 // It does nothing if the ac is not IDLE.
 // TODO(bar) Move this to the addrConn section.
 func (ac *addrConn) connect() error {
+
+	//fmt.Printf("*&*&*&*&*&* 开始 connect() 流程 !!!!! \n")
+
+	var bUse BackOffUse
+
+	for _, addr := range ac.addrs {
+		if _, ok := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]; !ok {
+			//fmt.Printf("*&*&*&*&*&* 地址 %v 不在记录 addrBackOffRecord中，需要将其添加进去 !!!!! \n", addr)
+			g_grpcBackOffRec.Lock()
+			bUse = BackOffUse{BackOffIndex: 0, BackOffGoroutines: 0, timeToBackOff: 0 * time.Second}
+			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+			g_grpcBackOffRec.Unlock()
+		}
+	}
+
+	//g_grpcBackOffRec.RLock()
+	//fmt.Printf("&*&*&*&&*&* 目前 addrBackOffRecord 记录状况 : %+v \n", g_grpcBackOffRec.addrBackOffRecord)
+	//g_grpcBackOffRec.RUnlock()
+
 	ac.mu.Lock()
 	if ac.state == connectivity.Shutdown {
 		ac.mu.Unlock()
@@ -1006,6 +1026,19 @@ func (ac *addrConn) adjustParams(r transport.GoAwayReason) {
 	}
 }
 
+type BackOffUse struct {
+	BackOffIndex      int
+	BackOffGoroutines int
+	timeToBackOff     time.Duration
+}
+
+type BackOff struct {
+	sync.RWMutex
+	addrBackOffRecord map[string]BackOffUse
+}
+
+var g_grpcBackOffRec BackOff
+
 func (ac *addrConn) resetTransport() {
 	for i := 0; ; i++ {
 		if i > 0 {
@@ -1020,6 +1053,9 @@ func (ac *addrConn) resetTransport() {
 
 		addrs := ac.addrs
 		backoffFor := ac.dopts.bs.Backoff(ac.backoffIdx)
+
+		//fmt.Printf("*** Into resetTransport, addrs = %v ; i = %v ; ac.backoffIdx = %v \n", addrs, i, ac.backoffIdx)
+
 		// This will be the duration that dial gets to finish.
 		dialDuration := minConnectTimeout
 		if ac.dopts.minConnectTimeout != nil {
@@ -1030,6 +1066,7 @@ func (ac *addrConn) resetTransport() {
 			// Give dial more time as we keep failing to connect.
 			dialDuration = backoffFor
 		}
+
 		// We can potentially spend all the time trying the first address, and
 		// if the server accepts the connection and then hangs, the following
 		// addresses will never be tried.
@@ -1146,6 +1183,34 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 		}
 		ac.mu.Unlock()
 
+		var bUse BackOffUse
+		//如果地址有backOff记录，则需要执行回退等待流程，以防止DNS查询量在短时间内激增
+		g_grpcBackOffRec.RLock()
+		if _, ok := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]; ok {
+			bRec := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
+			bUse = bRec
+			g_grpcBackOffRec.RUnlock()
+
+			//fmt.Printf("^&^&^&^&^&^&^& 地址有backOff记录，检查是否不进行重复连接 Addr %v; bRec: %+v ... \n",addr.Addr, bRec)
+
+			if bUse.BackOffGoroutines >= 1 {
+				//fmt.Printf("^&^&^&^&^&^&^& 有线程正等待连接此地址（%v），不再等待直接跳过！  \n", addr.Addr)
+				continue
+			} else {
+				g_grpcBackOffRec.Lock()
+				bUse.BackOffGoroutines++
+				g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+				g_grpcBackOffRec.Unlock()
+			}
+
+		} else {
+			g_grpcBackOffRec.RUnlock()
+			return nil, resolver.Address{}, nil, fmt.Errorf("address has no record ")
+		}
+
+		dialDuration := 5 * time.Second
+		connectDeadlineAfterBackOff := time.Now().Add(dialDuration)
+
 		if channelz.IsOn() {
 			channelz.AddTraceEvent(ac.channelzID, &channelz.TraceEventDesc{
 				Desc:     fmt.Sprintf("Subchannel picks a new address %q to connect", addr.Addr),
@@ -1153,9 +1218,49 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 			})
 		}
 
-		newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadline)
+		//newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadline)
+		newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadlineAfterBackOff)
 		if err == nil {
+
+			fmt.Printf("***********  连接成功(addr %v)，将记录各项计数清零 ！ \n", addr.Addr)
+			//连接成功后将等待Goroutines数量减少
+			g_grpcBackOffRec.Lock()
+			bRec := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
+			bUse = bRec
+			if bUse.BackOffGoroutines > 0 {
+				bUse.BackOffGoroutines--
+			}
+			bUse.BackOffIndex = 0
+			bUse.timeToBackOff = 0
+			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+			g_grpcBackOffRec.Unlock()
+
 			return newTr, addr, reconnect, nil
+		} else {
+			//如果连接失败，则添加回退时间，下次连接时进行检查并睡眠主动回退; 将等待Goroutines数量减少
+			var bUse BackOffUse
+
+			g_grpcBackOffRec.RLock()
+			bRec := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
+			g_grpcBackOffRec.RUnlock()
+			bUse = bRec
+
+			//fmt.Printf("####### 连接失败(err: %v)，首先在此goroutine中检查是否要进行sleep，再进行后续记录操作 \n", err)
+			bUse.BackOffIndex++
+			backoffFor := ac.dopts.bs.Backoff(bUse.BackOffIndex)
+			bUse.timeToBackOff = backoffFor
+			if bUse.BackOffIndex > 0 {
+				fmt.Printf("####### 需要sleep %v 秒 ; 现在时间：%v ，预计下次重连时间：%v ，Zzzzz....\n", bUse.timeToBackOff/1000000000, time.Now().Format("2006-01-02T15:04:05-0700"), time.Now().Add(bUse.timeToBackOff).Format("2006-01-02T15:04:05-0700"))
+				time.Sleep(bUse.timeToBackOff)
+			}
+
+			if bUse.BackOffGoroutines > 0 {
+				bUse.BackOffGoroutines--
+			}
+
+			g_grpcBackOffRec.Lock()
+			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+			g_grpcBackOffRec.Unlock()
 		}
 		ac.cc.blockingpicker.updateConnectionError(err)
 	}
