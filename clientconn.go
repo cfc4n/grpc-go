@@ -757,15 +757,15 @@ func (ac *addrConn) connect() error {
 
 	var bUse BackOffUse
 
+	g_grpcBackOffRec.Lock()
 	for _, addr := range ac.addrs {
 		if _, ok := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]; !ok {
 			//fmt.Printf("*&*&*&*&*&* 地址 %v 不在记录 addrBackOffRecord中，需要将其添加进去 !!!!! \n", addr)
-			g_grpcBackOffRec.Lock()
 			bUse = BackOffUse{BackOffIndex: 0, BackOffGoroutines: 0, timeToBackOff: 0 * time.Second}
 			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
-			g_grpcBackOffRec.Unlock()
 		}
 	}
+	g_grpcBackOffRec.Unlock()
 
 	//g_grpcBackOffRec.RLock()
 	//fmt.Printf("&*&*&*&&*&* 目前 addrBackOffRecord 记录状况 : %+v \n", g_grpcBackOffRec.addrBackOffRecord)
@@ -1218,34 +1218,43 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 			})
 		}
 
+		bUse.BackOffIndex = 0
+		bUse.BackOffGoroutines = 0
+		bUse.timeToBackOff = 0
 		//newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadline)
 		newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadlineAfterBackOff)
 		if err == nil {
-
-			fmt.Printf("***********  连接成功(addr %v)，将记录各项计数清零 ！ \n", addr.Addr)
-			//连接成功后将等待Goroutines数量减少
+			fmt.Printf("***********  连接成功(addr %v)，将所有记录各项计数清零 ！ \n", addr.Addr)
+			//连接成功后将所有连接记录数据清空，以便下次连接重新使用
 			g_grpcBackOffRec.Lock()
-			bRec := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
-			bUse = bRec
-			if bUse.BackOffGoroutines > 0 {
-				bUse.BackOffGoroutines--
+			for keyAddr, _ := range g_grpcBackOffRec.addrBackOffRecord {
+
+				fmt.Printf("** keyAddr = %v ！ \n", keyAddr)
+
+				if keyAddr == addr.Addr {
+					bUse.BackOffIndex = 0
+				} else {
+					bUse.BackOffIndex = -1
+				}
+				g_grpcBackOffRec.addrBackOffRecord[keyAddr] = bUse
 			}
-			bUse.BackOffIndex = 0
-			bUse.timeToBackOff = 0
-			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+			//fmt.Printf("&*&*&*&&*&* 目前 addrBackOffRecord 记录状况 : %+v \n", g_grpcBackOffRec.addrBackOffRecord)
 			g_grpcBackOffRec.Unlock()
 
 			return newTr, addr, reconnect, nil
 		} else {
 			//如果连接失败，则添加回退时间，下次连接时进行检查并睡眠主动回退; 将等待Goroutines数量减少
-			var bUse BackOffUse
-
 			g_grpcBackOffRec.RLock()
 			bRec := g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
 			g_grpcBackOffRec.RUnlock()
 			bUse = bRec
 
 			//fmt.Printf("####### 连接失败(err: %v)，首先在此goroutine中检查是否要进行sleep，再进行后续记录操作 \n", err)
+
+			if bUse.BackOffIndex == -1 {
+				bUse.BackOffIndex = 0
+			}
+
 			bUse.BackOffIndex++
 			backoffFor := ac.dopts.bs.Backoff(bUse.BackOffIndex)
 			bUse.timeToBackOff = backoffFor
@@ -1259,7 +1268,17 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 			}
 
 			g_grpcBackOffRec.Lock()
+			bRec = g_grpcBackOffRec.addrBackOffRecord[addr.Addr]
+			//发现记录BackOffIndex被标记为-1，说明连接已经成功，本次连接退出时清除所有记录项值
+			if bRec.BackOffIndex == -1 {
+				bUse.timeToBackOff = 0
+				bUse.BackOffIndex = 0
+				bUse.BackOffGoroutines = 0
+			}
 			g_grpcBackOffRec.addrBackOffRecord[addr.Addr] = bUse
+
+			//fmt.Printf("&*&*&*&&*&* 目前 addrBackOffRecord 记录状况 : %+v \n", g_grpcBackOffRec.addrBackOffRecord)
+
 			g_grpcBackOffRec.Unlock()
 		}
 		ac.cc.blockingpicker.updateConnectionError(err)
