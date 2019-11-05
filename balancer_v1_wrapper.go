@@ -20,12 +20,12 @@ package grpc
 
 import (
 	"context"
-	"sync"
-
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/resolver"
+	"reflect"
+	"sync"
 )
 
 type balancerWrapperBuilder struct {
@@ -33,10 +33,14 @@ type balancerWrapperBuilder struct {
 }
 
 func (bwb *balancerWrapperBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
-	bwb.b.Start(opts.Target.Endpoint, BalancerConfig{
+	err := bwb.b.Start(opts.Target.Endpoint, BalancerConfig{
 		DialCreds: opts.DialCreds,
 		Dialer:    opts.Dialer,
 	})
+	if err != nil {
+		grpclog.Fatalf("bwb.b.Start error :%v", err)
+		//bwb.b.Close()
+	}
 	_, pickfirst := bwb.b.(*pickFirst)
 	bw := &balancerWrapper{
 		balancer:   bwb.b,
@@ -113,7 +117,7 @@ func (bw *balancerWrapper) lbWatcher() {
 	}
 
 	for addrs := range notifyCh {
-		grpclog.Infof("balancerWrapper: got update addr from Notify: %v", addrs)
+		//grpclog.Infof("balancerWrapper: got update addr from Notify: %v", addrs)
 		if bw.pickfirst {
 			var (
 				oldA  resolver.Address
@@ -173,9 +177,13 @@ func (bw *balancerWrapper) lbWatcher() {
 		} else {
 			var (
 				add []resolver.Address // Addresses need to setup connections.
-				del []balancer.SubConn // Connections need to tear down.
+				//del []balancer.SubConn // Connections need to tear down.  addrConn.resetTransport() will reconnect it,so don't remove.
 			)
 			resAddrs := make(map[resolver.Address]Address)
+			if len(addrs) <= 0 {
+				//addrs长度为0，则退出 	//@TODO 为什么addrs会是空的
+				continue
+			}
 			for _, a := range addrs {
 				resAddrs[resolver.Address{
 					Addr:       a.Addr,
@@ -186,19 +194,56 @@ func (bw *balancerWrapper) lbWatcher() {
 			}
 			bw.mu.Lock()
 			for a := range resAddrs {
-				if _, ok := bw.conns[a]; !ok {
+				if k, ok := bw.conns[a]; ok {
+					if v, ok := bw.connSt[k]; ok {
+						//grpclog.Infof("……… bo.connSt[k] status:%v",v.s)
+						if v.s == connectivity.Shutdown {
+							//仅当 状态异常时，重新添加
+							add = append(add, a)
+						}
+					}
+				} else {
 					add = append(add, a)
 				}
 			}
-			for a, c := range bw.conns {
-				if _, ok := resAddrs[a]; !ok {
-					del = append(del, c)
-					delete(bw.conns, a)
-					// Keep the state of this sc in bw.connSt until its state becomes Shutdown.
-				}
-			}
+
 			bw.mu.Unlock()
 			for _, a := range add {
+				var beFound bool
+
+				bw.mu.Lock()
+				for k, sc := range bw.conns {
+					//判断bw.conns[a]是否存在
+					//判断结构是否相等
+					if !reflect.DeepEqual(k, a) {
+						continue
+					}
+
+					//状态是否是连接中
+					if st, found1 := bw.connSt[sc]; found1 {
+						//如果这地址的状态是Idl、 connection或 ready，则直接跳过
+						switch st.s {
+						case connectivity.Idle:
+							fallthrough
+						case connectivity.Connecting:
+							fallthrough
+						case connectivity.Ready:
+							fallthrough
+						case connectivity.TransientFailure:
+							beFound = true
+							break
+						default:
+						}
+					}
+				}
+				bw.mu.Unlock()
+
+				//如果这个addr在bw.conns中已经存在，且状态是Idl、connection、ready等状态，则跳出
+				if beFound {
+					//grpclog.Infof("Found exist addr:%v, break",a)
+					break
+				}
+
 				sc, err := bw.cc.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{})
 				if err != nil {
 					grpclog.Warningf("Error creating connection to %v. Err: %v", a, err)
@@ -212,9 +257,6 @@ func (bw *balancerWrapper) lbWatcher() {
 					bw.mu.Unlock()
 					sc.Connect()
 				}
-			}
-			for _, c := range del {
-				bw.cc.RemoveSubConn(c)
 			}
 		}
 	}
