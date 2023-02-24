@@ -103,6 +103,9 @@ func newCCBalancerWrapper(cc *ClientConn, b balancer.Builder, bopts balancer.Bui
 		done:             make(chan struct{}),
 		subConns:         make(map[*acBalancerWrapper]struct{}),
 	}
+
+	g_grpcBackOffRec.addrBackOffRecord = make(map[string]BackOffUse, 1024)
+
 	go ccb.watcher()
 	ccb.balancer = b.Build(ccb, bopts)
 	return ccb
